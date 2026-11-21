@@ -57,6 +57,63 @@ New128 returns a new hash.Hash computing SipHash-2-4 with 16-byte key and 16-byt
 Note that 16-byte output is considered experimental by SipHash authors at this time.
 
 
+## Versioned key ring
+
+For cached indexes whose shard keys must be rotated without invalidating every
+existing entry, the package provides a versioned key ring, `KeyRing`. A single
+master key derives an independent 128-bit SipHash key per **tenant** and
+**generation**; each generated hash is tagged with an opaque, irreversible
+generation identifier, so old and new hashes can coexist during a rotation
+window and old generations can then be retired and erased.
+
+    ring, err := siphash.NewKeyRing(masterKey, []byte("tenant-a"))
+    if err != nil { ... }
+
+    tagged, err := ring.Hash(shardKey)   // current generation, 8-byte sum + KeyID
+    // store tagged.KeyID and tagged.Sum next to the index entry.
+
+    // Later, possibly after a rotation:
+    gen, state, err := ring.Verify(tagged.KeyID, shardKey, tagged.Sum)
+
+Lifecycle and guarantees:
+
+* **Derivation.** Keys and the `KeyID` tag are PRF outputs of SipHash under the
+  master key, over an unambiguously encoded `(tenant, generation, domain)`
+  input. The tag reveals neither the generation number nor any key material,
+  and two tenants or two generations always derive independent keys. Rebuilding
+  a ring from the same master key and tenant reproduces every generation, so
+  stored tags remain verifiable across restarts.
+* **Overlap window.** `Rotate` atomically installs a new generation for new
+  writes; all earlier generations stay active and verifiable until `Retire` is
+  called. Retiring zeroizes the generation's key material and rejects its
+  hashes; `PurgeRetired` removes them so the tags become unknown. The current
+  generation cannot be retired, and retiring an already-retired generation is a
+  no-op that never reactivates the key.
+* **Constant time.** Hash and tag comparisons, and selection of the generation
+  for a tag, use constant-time primitives (`ConstantTimeCompare`,
+  `ConstantTimeCompareKeyID`, `ConstantTimeCompare64` are exported for callers
+  storing values themselves). All returned errors are static sentinels and
+  never contain keys, inputs, or hash values.
+* **Batch verification.** `VerifyBatch` returns one `BatchResult` per item,
+  each carrying its generation state. It is read-only and takes one consistent
+  snapshot, so cancelling via `context.Context` cannot leave a partial rotation
+  or update any generation; unprocessed items are reported with the context
+  error.
+* **Concurrency.** All methods are safe for concurrent use. Reads copy an
+  immutable generation snapshot under the lock and hash outside the lock, so a
+  concurrent hash and rotation only ever observe a complete generation, and a
+  late-arriving task can never recover or reactivate a retired key.
+* **Legacy compatibility.** `NewLegacyKeyRing` wraps an existing raw 16-byte
+  key as a single-generation ring whose hashes are byte-identical to the
+  package-level `Hash`/`Hash128` for that key, enabling the tagging and
+  verification API without re-indexing. Such a ring holds no master key and
+  cannot rotate; use a derived ring to enable rotation.
+
+The 64-bit and 128-bit outputs, the amd64/ARM assembly and the generic fallback
+paths, and the one-shot `Hash`/`Hash128` API are unchanged and keep producing
+their existing reference-vector results.
+
+
 ## Public domain dedication
 
 Written by Dmitry Chestnykh and Damian Gryski.
